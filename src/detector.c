@@ -395,6 +395,15 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     destroy_all_windows_cv();
 #endif
 
+    // Write training metadata to an output 'training_results.txt' file
+    list *vlist = get_paths(valid_images);
+    int valid_images_num = vlist->size;
+
+    FILE *training_results;
+    training_results = fopen("training_results.txt", "w");
+    fprintf(training_results, "Training Images: %d\nValidation Images: %d\nValidation Best mAP: %f\nValidation Final mAP: %f\n", train_images_num, valid_images_num, best_map, mean_average_precision);
+    fclose(training_results);
+
     // free memory
     pthread_join(load_thread, 0);
     free_data(buffer);
