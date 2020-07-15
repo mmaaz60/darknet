@@ -227,6 +227,31 @@ void backward_network_gpu(network net, network_state state)
         */
     }
 
+    if (net.adversarial && net.attention)
+    {
+        int img_size = net.w * net.h * net.c;
+        float *original_input_cpu = (float *)xcalloc(img_size, sizeof(float));
+        float *original_delta_cpu = (float *)xcalloc(img_size, sizeof(float));
+        cuda_pull_array(original_input, original_input_cpu, img_size);
+        cuda_pull_array(original_delta, original_delta_cpu, img_size);
+
+        image attention_img = make_attention_image(img_size, original_delta_cpu, original_input_cpu, net.w, net.h, net.c);
+        show_image(attention_img, "attention_img");
+        resize_window_cv("attention_img", 500, 500);
+
+        free_image(attention_img);
+
+        free(original_input_cpu);
+        free(original_delta_cpu);
+    }
+    if (net.adversarial) {
+        int x_size = get_network_input_size(net)*net.batch;
+        printf(" x_size = %d, original_delta = %p, original_input = %p, net.learning_rate = %f \n",
+            x_size, original_delta, original_input, net.learning_rate);
+        axpy_ongpu(x_size, net.learning_rate, original_delta, 1, original_input, 1);
+        constrain_min_max_ongpu(x_size, 0, 1, original_input, 1);
+    }
+
     if (net.benchmark_layers) {
         printf("\n\nSorted by time (backward):\n");
         qsort(sorted_avg_time_per_layer, net.n, sizeof(time_benchmark_layers), time_comparator);
@@ -249,6 +274,8 @@ void update_network_gpu(network net)
         l.t = get_current_batch(net);
         if (iteration_num > (net.max_batches * 1 / 2)) l.deform = 0;
         if (l.burnin_update && (l.burnin_update*net.burn_in > iteration_num)) continue;
+        if (l.train_only_bn) continue;
+
         if(l.update_gpu && l.dont_update < iteration_num){
             l.update_gpu(l, update_batch, rate, net.momentum, net.decay, net.loss_scale);
         }
@@ -272,6 +299,9 @@ void forward_backward_network_gpu(network net, float *x, float *y)
     }
     state.input = *net.input_gpu;
     state.delta = 0;
+    if (net.adversarial) {
+        state.delta = cuda_make_array(NULL, x_size);
+    }
     state.truth = *net.truth_gpu;
     state.train = 1;
 #if defined(CUDNN_HALF) && defined(CUDNN)
@@ -297,9 +327,11 @@ void forward_backward_network_gpu(network net, float *x, float *y)
                     cuda_convert_f32_to_f16(l.vo->weights_gpu, l.vo->nweights, l.vo->weights_gpu16);
                 }
                 cuda_convert_f32_to_f16(l.wf->weights_gpu, l.wf->nweights, l.wf->weights_gpu16);
-                cuda_convert_f32_to_f16(l.wi->weights_gpu, l.wi->nweights, l.wi->weights_gpu16);
-                cuda_convert_f32_to_f16(l.wg->weights_gpu, l.wg->nweights, l.wg->weights_gpu16);
-                cuda_convert_f32_to_f16(l.wo->weights_gpu, l.wo->nweights, l.wo->weights_gpu16);
+                if (!l.bottleneck) {
+                    cuda_convert_f32_to_f16(l.wi->weights_gpu, l.wi->nweights, l.wi->weights_gpu16);
+                    cuda_convert_f32_to_f16(l.wg->weights_gpu, l.wg->nweights, l.wg->weights_gpu16);
+                    cuda_convert_f32_to_f16(l.wo->weights_gpu, l.wo->nweights, l.wo->weights_gpu16);
+                }
                 cuda_convert_f32_to_f16(l.uf->weights_gpu, l.uf->nweights, l.uf->weights_gpu16);
                 cuda_convert_f32_to_f16(l.ui->weights_gpu, l.ui->nweights, l.ui->weights_gpu16);
                 cuda_convert_f32_to_f16(l.ug->weights_gpu, l.ug->nweights, l.ug->weights_gpu16);
@@ -311,11 +343,59 @@ void forward_backward_network_gpu(network net, float *x, float *y)
     forward_network_gpu(net, state);
     //cudaStreamSynchronize(get_cuda_stream());
     backward_network_gpu(net, state);
+
+    if (net.adversarial) {
+        cuda_free(state.delta);
+        cuda_pull_array(*net.input_gpu, x, x_size);
+    }
+    if(*(state.net.total_bbox) > 0)
+        fprintf(stderr, " total_bbox = %d, rewritten_bbox = %f %% \n", *(state.net.total_bbox), 100 * (float)*(state.net.rewritten_bbox) / *(state.net.total_bbox));
 }
 
 float train_network_datum_gpu(network net, float *x, float *y)
 {
     *net.seen += net.batch;
+    if (net.adversarial_lr && rand_int(0, 1) == 1 && get_current_iteration(net) > net.burn_in) {
+        net.adversarial = 1;
+        float lr_old = net.learning_rate;
+        float scale = (get_current_iteration(net) / ((float)net.max_batches));
+        //scale = sin(scale * M_PI);
+        net.learning_rate = net.adversarial_lr * scale;
+        layer l = net.layers[net.n - 1];
+        int y_size = get_network_output_size(net)*net.batch;
+        if (net.layers[net.n - 1].truths) y_size = net.layers[net.n - 1].truths*net.batch;
+        float *truth_cpu = (float *)xcalloc(y_size, sizeof(float));
+
+        const int img_size = net.w*net.h*net.c;
+        float *old_input = (float *)xcalloc(img_size*net.batch, sizeof(float));
+        memcpy(old_input, x, img_size*net.batch * sizeof(float));
+
+        printf("\n adversarial training, adversarial_lr = %f \n", net.adversarial_lr * scale);
+
+        forward_backward_network_gpu(net, x, truth_cpu);
+
+        int b;
+        for (b = 0; b < net.batch; ++b) {
+            if (b % 2 == 1 && net.contrastive) {
+                //printf(" b = %d old img, ", b);
+                memcpy(x + img_size*b, old_input + img_size*b, img_size * sizeof(float));
+            }
+        }
+
+        image im;
+        im.w = net.w;
+        im.h = net.h;
+        im.c = net.c;
+        im.data = x;
+        show_image(im, "adversarial data augmentation");
+        resize_window_cv("adversarial data augmentation", 500, 500);
+        wait_key_cv(1);
+
+        free(old_input);
+        free(truth_cpu);
+        net.learning_rate = lr_old;
+        net.adversarial = 0;
+    }
     forward_backward_network_gpu(net, x, y);
     float error = get_network_cost(net);
     //if (((*net.seen) / net.batch) % net.subdivisions == 0) update_network_gpu(net);
@@ -567,6 +647,7 @@ float train_networks(network *nets, int n, data d, int interval)
     }
     //cudaDeviceSynchronize();
     *nets[0].cur_iteration += (n - 1);
+    *nets[0].seen = nets[0].batch * nets[0].subdivisions * get_current_iteration(nets[0]); // remove this line, when you will save to weights-file both: seen & cur_iteration
     if (get_current_iteration(nets[0]) % interval == 0)
     {
         printf("Syncing... ");
