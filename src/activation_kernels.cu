@@ -36,10 +36,12 @@ __device__ float relie_activate_kernel(float x){return (x>0) ? x : .01f*x;}
 __device__ float ramp_activate_kernel(float x){return x*(x>0)+.1f*x;}
 __device__ float leaky_activate_kernel(float x){return (x>0) ? x : .1f*x;}
 __device__ float tanh_activate_kernel(float x){return (2/(1 + expf(-2*x)) - 1);}
+__device__ float gelu_activate_kernel(float x){return (0.5*x*(1 + tanhf(0.797885*x + 0.035677*powf(x, 3))));}
 __device__ float softplus_kernel(float x, float threshold = 20) {
     if (x > threshold) return x;                // too large
     else if (x < -threshold) return expf(x);    // too small
-    return logf(expf(x) + 1);
+    return log1pf(expf(x));
+    //return logf(expf(x) + 1);
 }
 __device__ float plse_activate_kernel(float x)
 {
@@ -75,6 +77,11 @@ __device__ float relie_gradient_kernel(float x){return (x>0) ? 1 : .01f;}
 __device__ float ramp_gradient_kernel(float x){return (x>0)+.1f;}
 __device__ float leaky_gradient_kernel(float x){return (x>0) ? 1 : .1f;}
 __device__ float tanh_gradient_kernel(float x){return 1-x*x;}
+__device__ float sech_gpu(float x) { return 2 / (expf(x) + expf(-x)); }
+__device__ float gelu_gradient_kernel(float x) {
+    const float x3 = powf(x, 3);
+    return 0.5*tanhf(0.0356774*x3 + 0.797885*x) + (0.0535161*x3 + 0.398942*x) * powf(sech_gpu(0.0356774*x3 + 0.797885*x), 2) + 0.5;
+}
 __device__ float plse_gradient_kernel(float x){return (x < 0 || x > 1) ? .01f : .125f;}
 __device__ float stair_gradient_kernel(float x)
 {
@@ -99,6 +106,8 @@ __device__ float activate_kernel(float x, ACTIVATION a)
             return elu_activate_kernel(x);
         case SELU:
             return selu_activate_kernel(x);
+        case GELU:
+            return gelu_activate_kernel(x);
         case RELIE:
             return relie_activate_kernel(x);
         case RAMP:
@@ -138,6 +147,8 @@ __device__ float gradient_kernel(float x, ACTIVATION a)
         return elu_gradient_kernel(x);
     case SELU:
         return selu_gradient_kernel(x);
+    case GELU:
+        return gelu_gradient_kernel(x);
     case RELIE:
         return relie_gradient_kernel(x);
     case RAMP:
@@ -207,9 +218,41 @@ __global__ void activate_array_swish_kernel(float *x, int n, float *output_sigmo
     if (i < n) {
         float x_val = x[i];
         float sigmoid = logistic_activate_kernel(x_val);
-        output_sigmoid_gpu[i] = sigmoid;
+        if (output_sigmoid_gpu) output_sigmoid_gpu[i] = sigmoid;
         output_gpu[i] = x_val * sigmoid;
     }
+}
+
+__device__ float mish_njuffa(float x)
+{
+    float r;
+    float e = expf(x);
+    r = 1.0f / fmaf(fmaf(-0.5f, e, -1.0f), e, -1.0f);
+    r = fmaf(r, x, x);
+    return r;
+}
+
+__device__ float mish_yashas(float x)
+{
+    float e = __expf(x);
+    if (x <= -18.0f)
+        return x * e;
+
+    float n = e * e + 2 * e;
+    if (x <= -5.0f)
+        return x * __fdividef(n, n + 2);
+
+    return x - 2 * __fdividef(x, n + 2);
+}
+
+__device__ float mish_yashas2(float x)
+{
+    float e = __expf(x);
+    float n = e * e + 2 * e;
+    if (x <= -0.6f)
+        return x * __fdividef(n, n + 2);
+
+    return x - 2 * __fdividef(x, n + 2);
 }
 
 // https://github.com/digantamisra98/Mish
@@ -219,13 +262,15 @@ __global__ void activate_array_mish_kernel(float *x, int n, float *activation_in
     if (i < n) {
         const float MISH_THRESHOLD = 20;
         float x_val = x[i];
-        activation_input[i] = x_val;    // store value before activation
+        if (activation_input) activation_input[i] = x_val;    // store value before activation
         //output_gpu[i] = x_val * tanh_activate_kernel(logf(1 + expf(x_val)));
 
         // Pytorch: https://github.com/thomasbrandon/mish-cuda/blob/master/csrc/mish.h#L17-L20
         // TF: https://github.com/tensorflow/addons/blob/093cdfa85d334cbe19a37624c33198f3140109ed/tensorflow_addons/custom_ops/activations/cc/kernels/mish_op.h#L40-L49
         // log1p(x) == log(x + 1)
-        output_gpu[i] = x_val * tanh_activate_kernel( softplus_kernel(x_val, MISH_THRESHOLD) );
+        //output_gpu[i] = x_val * tanh_activate_kernel( softplus_kernel(x_val, MISH_THRESHOLD) );
+        output_gpu[i] = mish_yashas2(x_val);
+        //output_gpu[i] = mish_njuffa(x_val);
     }
 }
 
@@ -242,6 +287,14 @@ __global__ void activate_array_selu_kernel(float *x, int n)
     int index = blockIdx.x*blockDim.x + threadIdx.x;
     if (index < n) {
         x[index] = selu_activate_kernel(x[index]);
+    }
+}
+
+__global__ void activate_array_gelu_kernel(float *x, int n)
+{
+    int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < n) {
+        x[index] = gelu_activate_kernel(x[index]);
     }
 }
 
@@ -313,7 +366,8 @@ __global__ void gradient_array_mish_kernel(int n, float *activation_input_gpu, f
         // log1p(x) == log(x + 1)
         const float inp = activation_input_gpu[i];
         const float sp = softplus_kernel(inp, MISH_THRESHOLD);
-        const float grad_sp = 1 - expf(-sp);
+        const float grad_sp = -expm1f(-sp);
+        //const float grad_sp = 1 - expf(-sp);
         const float tsp = tanh(sp);
         const float grad_tsp = (1 - tsp*tsp) * grad_sp;
         const float grad = inp * grad_tsp + tsp;
@@ -335,11 +389,27 @@ __global__ void gradient_array_leaky_kernel(float *x, int n, float *delta)
     }
 }
 
+__global__ void gradient_array_revleaky_kernel(float *x, int n, float *delta)
+{
+    int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < n) {
+        delta[index] /= leaky_gradient_kernel(x[index]);
+    }
+}
+
 __global__ void gradient_array_selu_kernel(float *x, int n, float *delta)
 {
     int index = blockIdx.x*blockDim.x + threadIdx.x;
     if (index < n) {
         delta[index] *= selu_gradient_kernel(x[index]);
+    }
+}
+
+__global__ void gradient_array_gelu_kernel(float *x, int n, float *delta)
+{
+    int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < n) {
+        delta[index] *= gelu_gradient_kernel(x[index]);
     }
 }
 
@@ -387,13 +457,14 @@ extern "C" void activate_array_ongpu(float *x, int n, ACTIVATION a)
 {
     const int num_blocks = get_number_of_blocks(n, BLOCK);
     if (a == LINEAR) return;
-    else if(a == LEAKY) activate_array_leaky_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n);
+    else if (a == LEAKY || a == REVLEAKY) activate_array_leaky_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n);
     else if (a == LOGISTIC) activate_array_logistic_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n);
     else if (a == TANH) activate_array_tanh_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n);
     else if (a == HARDTAN) activate_array_hardtan_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n);
     else if (a == RELU) activate_array_relu_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n);
     else if (a == RELU6) activate_array_relu6_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n);
     else if (a == SELU) activate_array_selu_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n);
+    else if (a == GELU) activate_array_gelu_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n);
     else
         activate_array_kernel<<<cuda_gridsize(n), BLOCK, 0, get_cuda_stream()>>>(x, n, a);
     CHECK_CUDA(cudaPeekAtLastError());
@@ -418,6 +489,7 @@ extern "C" void gradient_array_ongpu(float *x, int n, ACTIVATION a, float *delta
     const int num_blocks = get_number_of_blocks(n, BLOCK);
     if (a == LINEAR) return;
     else if (a == LEAKY) gradient_array_leaky_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n, delta);
+    else if (a == REVLEAKY) gradient_array_revleaky_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n, delta);
     else if (a == LOGISTIC) gradient_array_logistic_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n, delta);
     else if (a == TANH) gradient_array_tanh_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n, delta);
     else if (a == HARDTAN) gradient_array_hardtan_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n, delta);
@@ -429,6 +501,7 @@ extern "C" void gradient_array_ongpu(float *x, int n, ACTIVATION a, float *delta
         exit(0);
     }
     else if (a == SELU) gradient_array_selu_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n, delta);
+    else if (a == GELU) gradient_array_gelu_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n, delta);
     else
         gradient_array_kernel << <cuda_gridsize(n), BLOCK, 0, get_cuda_stream() >> > (x, n, a, delta);
     CHECK_CUDA(cudaPeekAtLastError());
